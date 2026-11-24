@@ -809,7 +809,12 @@ impl Host {
                 // SAFETY: a read-back buffer the finished list resolved
                 // into; `end` is inside it (the resolve checked the
                 // title's own buffer, and the buffer was made that size).
-                if unsafe { readback.Map(0, Some(&range), Some(&mut data)) }.is_err() {
+                if let Err(e) = unsafe { readback.Map(0, Some(&range), Some(&mut data)) } {
+                    tracing::warn!(
+                        error = %e,
+                        targets = targets.len(),
+                        "query results not read back",
+                    );
                     continue;
                 }
                 for &(at, offset, bytes) in targets {

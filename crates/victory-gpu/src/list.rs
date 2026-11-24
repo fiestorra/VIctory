@@ -863,13 +863,16 @@ pub(crate) extern "system" fn resolve_queries(
             .is_some_and(|end| end <= size);
     #[cfg(windows)]
     if measured
+        && count > 0
         && let Some(list) = host_list(this)
         && let Some((host, query)) = crate::query::host(heap)
+        && crate::query::range_fits(heap, first, count)
         && let Some(readback) =
             crate::host::host().and_then(|h| h.readback_buffer(u64::from(count.max(1)) * 8))
     {
         // SAFETY: an open list, our heap and a buffer made for exactly
-        // these results, in the state a resolve needs.
+        // these results, in the state a resolve needs; the resolve's range
+        // was checked against the heap's count.
         unsafe {
             list.list
                 .ResolveQueryData(&host, query, first, count, &readback, 0);
