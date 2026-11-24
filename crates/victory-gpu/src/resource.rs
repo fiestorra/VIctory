@@ -2507,4 +2507,294 @@ mod tests {
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
+
+    /// The ladder of descriptions a host texture is tried in.
+    #[test]
+    fn the_first_attempt_is_what_the_title_asked_for() {
+        assert_eq!(
+            attempts(5, 4),
+            [
+                (5, 4, true),
+                (5, 0, true),
+                (5, 4, false),
+                (5, 0, false),
+                (1, 0, true),
+                (1, 0, false),
+                (0, 0, false),
+            ]
+        );
+        // Nothing is tried twice.
+        assert_eq!(attempts(0, 0), [(0, 0, true), (0, 0, false)]);
+        // A depth target keeps its depth permission in every attempt.
+        let depth = attempts(3, 0x10);
+        assert!(depth.iter().all(|&(flags, _, _)| flags & 2 != 0));
+        // Permissions only ever go down the ladder.
+        let asked = attempts(7, 0).first().copied().unwrap().0;
+        assert!(
+            attempts(7, 0)
+                .iter()
+                .all(|&(flags, _, _)| flags & !asked == 0)
+        );
+    }
+
+    /// The ladder on the device: the `B5G5R5A1_UNORM` 2560x1440 target a boot
+    /// asks for, with a clear value in another format, still leaves a host
+    /// texture — the case that used to leave nothing at all — and it keeps
+    /// the permissions and the state the title asked for.
+    /// Run with `cargo test --release -p victory-gpu -- --ignored --nocapture texture_ladder`.
+    #[test]
+    #[ignore = "needs the host GPU"]
+    fn a_refused_description_still_leaves_a_texture() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        let Some(host) = crate::host::host() else {
+            println!("no host device");
+            return;
+        };
+        let desc = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 2560,
+            height: 1440,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 86, // B5G5R5A1_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 5, // render target and unordered access
+        };
+        // A clear value naming a format this resource does not have: the host
+        // refuses the creation outright with one of these, which is what the
+        // title's two 1440p targets look like.
+        let mut clear = [0u32; 5];
+        clear[0] = 28; // R8G8B8A8_UNORM
+        // The creation the old code made, once, with that clear value.
+        let plain = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: 2560,
+            Height: 1440,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(86),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAGS(5),
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut refused: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation with a clear value in another format.
+        let one_shot = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &raw const plain,
+                D3D12_RESOURCE_STATES(4),
+                Some(clear.as_ptr().cast::<D3D12_CLEAR_VALUE>()),
+                &mut refused,
+            )
+        };
+        match &one_shot {
+            Err(e) => println!("the one-shot creation is refused: {e}"),
+            Ok(()) => println!("this host takes that clear value; the ladder is not needed here"),
+        }
+        let made = make_texture(&desc, 4 /* render target */, clear.as_ptr().cast()).map(|t| {
+            let state = t.state.load(std::sync::atomic::Ordering::Relaxed);
+            (t.texture.clone(), state)
+        });
+        let Some((texture, state)) = made else {
+            panic!("no host texture at all");
+        };
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        assert_eq!(d.Format.0, 86, "the host copy is the format asked for");
+        // The ladder gives up permissions only from the last one that matters:
+        // the render target survives, and on a host that takes unordered
+        // access for this format so does that. (The RTX 4090 refuses
+        // `B5G5R5A1_UNORM` with a UAV outright, the integrated GPU does not.)
+        assert_ne!(
+            d.Flags.0 & 1,
+            0,
+            "the render-target permission is the one kept longest"
+        );
+        assert!(
+            state == 4 || state == 0,
+            "the state asked for, or the common one: {state:#x}"
+        );
+        println!(
+            "host texture: {}x{} format {} flags {:#x} of the {:#x} asked, state {state:#x}",
+            d.Width, d.Height, d.Format.0, d.Flags.0, desc.flags
+        );
+    }
+
+    /// What the host accepts for the descriptions a boot asks for and never
+    /// gets: two 2560x1440 textures, `B5G5R5A1_UNORM` with render-target and
+    /// unordered-access (format 86, flags 5) and `B4G4R4A4_UNORM` with
+    /// render-target (format 115, flags 1), both refused with `E_INVALIDARG`.
+    /// Run with `cargo test --release -p victory-gpu -- --ignored --nocapture packed_formats`.
+    #[test]
+    #[ignore = "needs the host GPU"]
+    fn packed_formats_the_host_refuses() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let mut made: Option<ID3D12Device> = None;
+        // SAFETY: a plain device for the default adapter.
+        let result = unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut made) };
+        let Ok(()) = result else {
+            println!("no D3D12 device: {result:?}");
+            return;
+        };
+        let Some(device) = made else { return };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        for format in [86u32, 115, 87, 28] {
+            for flags in [0u32, 1, 4, 5, 3] {
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Alignment: 0,
+                    Width: 2560,
+                    Height: 1440,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT(format as i32),
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                    Flags: D3D12_RESOURCE_FLAGS(flags as i32),
+                };
+                let mut texture: Option<ID3D12Resource> = None;
+                let clear: Option<*const D3D12_CLEAR_VALUE> = None;
+                // SAFETY: plain creation of a 2560x1440 texture.
+                let made = unsafe {
+                    device.CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &raw const desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        clear,
+                        &mut texture,
+                    )
+                };
+                println!(
+                    "format {format} flags {flags:#x}: {}",
+                    match &made {
+                        Ok(()) => "ok".to_owned(),
+                        Err(e) => format!("{e}"),
+                    }
+                );
+            }
+        }
+        // Every state a title may name, for the two descriptions a boot asks
+        // for and never gets.
+        let states = [
+            0x1u32, 0x2, 0x4, 0x8, 0xc, 0x10, 0x20, 0x40, 0x80, 0xc0, 0x200, 0x400, 0x800,
+        ];
+        for (format, flags) in [(86u32, 5u32), (115, 1)] {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: 2560,
+                Height: 1440,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAGS(flags as i32),
+            };
+            for state in states {
+                let mut texture: Option<ID3D12Resource> = None;
+                let clear: Option<*const D3D12_CLEAR_VALUE> = None;
+                // SAFETY: plain creation of a 2560x1440 texture.
+                let made = unsafe {
+                    device.CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &raw const desc,
+                        D3D12_RESOURCE_STATES(state as i32),
+                        clear,
+                        &mut texture,
+                    )
+                };
+                if made.is_err() {
+                    println!(
+                        "format {format} flags {flags} state {state:#x}: {}",
+                        match &made {
+                            Ok(()) => "ok".to_owned(),
+                            Err(e) => format!("{e}"),
+                        }
+                    );
+                }
+            }
+        }
+        // Clear values that do not name the resource's own format, for the
+        // colour pair and for the two depth pairs a boot asks for: the host
+        // copy of a depth texture is made as the pair's second format, and
+        // the title's clear names the first.
+        for (format, clear_format, flags) in [
+            (86u32, 86u32, 5u32),
+            (86, 0, 5),
+            (86, 28, 5),
+            (19, 19, 2),
+            (19, 20, 2),
+            (20, 20, 2),
+            (53, 55, 2),
+            (53, 53, 2),
+            (20, 20, 1),
+        ] {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Alignment: 0,
+                Width: 2560,
+                Height: 1440,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT(format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAGS(flags as i32),
+            };
+            let clear = D3D12_CLEAR_VALUE {
+                Format: DXGI_FORMAT(clear_format as i32),
+                Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a 2560x1440 texture with a clear value.
+            let made = unsafe {
+                device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &raw const desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    Some(&raw const clear),
+                    &mut texture,
+                )
+            };
+            println!(
+                "format {format} flags {flags} clear format {clear_format}: {}",
+                match &made {
+                    Ok(()) => "ok".to_owned(),
+                    Err(e) => format!("{e}"),
+                }
+            );
+        }
+    }
 }
