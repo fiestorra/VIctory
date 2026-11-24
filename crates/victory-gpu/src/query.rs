@@ -107,6 +107,18 @@ pub(crate) fn host(this: This) -> Option<(ID3D12QueryHeap, D3D12_QUERY_TYPE)> {
     Some((heap.host.clone()?, kind))
 }
 
+/// Whether a resolve of [`first`, `first + count`) names queries the heap
+/// has; a resolve whose range the heap refuses would leave its results
+/// unread, and garbage written where the title expects counts.
+pub(crate) fn range_fits(this: This, first: u32, count: u32) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    // SAFETY: the title passes a heap it created here.
+    let heap = unsafe { &*this.cast::<Heap>() };
+    first.checked_add(count).is_some_and(|end| end <= heap.desc.count)
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     object::answer(
         QUERY_HEAP,
