@@ -2634,6 +2634,55 @@ mod tests {
         );
     }
 
+    /// The `B4G4R4A4_UNORM` 2560x1440 render target a boot asks for (format
+    /// 115, flags 1), which NVIDIA adapters refuse both as a castable format
+    /// and as a render target: it still has to leave a host texture, because
+    /// the alternative is the reported crash — a draw with no target at all.
+    /// Run with `cargo test --release -p victory-gpu -- --ignored --nocapture packed_target`.
+    #[test]
+    #[ignore = "needs the host GPU"]
+    fn the_packed_render_target_a_boot_asks_for_still_exists() {
+        let Some(host) = crate::host::host() else {
+            println!("no host device");
+            return;
+        };
+        let _ = &host;
+        let desc = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 2560,
+            height: 1440,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 115, // B4G4R4A4_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1, // render target
+        };
+        // With the clear value a boot passes, in the resource's own format:
+        // the host refuses that combination on some NVIDIA drivers, which is
+        // the report (`format: 115`, `flags: 1`, then "no host texture").
+        let mut clear = [0u32; 5];
+        clear[0] = 115;
+        let made = make_texture(&desc, 4 /* render target */, clear.as_ptr().cast());
+        let Some(t) = made else {
+            panic!("no host texture for the packed 2560x1440 render target");
+        };
+        // SAFETY: a live resource.
+        let d = unsafe { t.texture.GetDesc() };
+        println!(
+            "packed target: {}x{} format {} flags {:#x} of the {:#x} asked, state {:#x}",
+            d.Width,
+            d.Height,
+            d.Format.0,
+            d.Flags.0,
+            desc.flags,
+            t.state.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert_eq!(d.Format.0, 115, "the format asked for");
+    }
+
     /// What the host accepts for the descriptions a boot asks for and never
     /// gets: two 2560x1440 textures, `B5G5R5A1_UNORM` with render-target and
     /// unordered-access (format 86, flags 5) and `B4G4R4A4_UNORM` with
