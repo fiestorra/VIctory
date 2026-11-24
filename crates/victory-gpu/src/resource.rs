@@ -1237,22 +1237,63 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     }
     if texture.is_none() {
         castable_formats.clear();
-        // SAFETY: the description has the host layout (checked size, same
-        // fields); the out pointer is ours.
-        let made = unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
-                D3D12_RESOURCE_STATES(initial as i32),
-                clear_value,
-                &mut texture,
-            )
-        };
-        if let Err(e) = made {
-            tracing::warn!(error = %e, desc = ?d, "no host texture");
+        // The host can refuse the description the title asked for (its
+        // initial state, its clear value, or a permission it will not give
+        // this format): try the asked one first, then the ones that give up
+        // what it may be refusing, and keep the first it takes, so a target
+        // exists instead of every draw that names it being lost.
+        let tries = attempts(d.flags, initial);
+        for (i, &(flags, made_in, keep_clear)) in tries.iter().enumerate() {
+            let mut trial = *d;
+            trial.flags = flags;
+            let try_clear = if keep_clear { clear_value } else { None };
+            texture = None;
+            // SAFETY: the description has the host layout (checked size, same
+            // fields); the out pointer is ours.
+            let made = unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    std::ptr::from_ref(&trial).cast(),
+                    D3D12_RESOURCE_STATES(made_in as i32),
+                    try_clear,
+                    &mut texture,
+                )
+            };
+            match made {
+                Ok(()) => {
+                    if i > 0 {
+                        // The host refused what the title asked for: name
+                        // what was given up, once for this texture.
+                        tracing::warn!(
+                            flags_asked = d.flags,
+                            flags_made = flags,
+                            state_asked = tries[0].1,
+                            state_made = made_in,
+                            clear_dropped = clear_value.is_some() && !keep_clear,
+                            "host texture made only as a fallback"
+                        );
+                    }
+                    initial = made_in;
+                    break;
+                }
+                Err(e) if i + 1 == tries.len() => {
+                    tracing::warn!(
+                        error = %e,
+                        desc = ?trial,
+                        state = made_in,
+                        title_state = state,
+                        clear_kept = clear_value.is_some() && keep_clear,
+                        "no host texture"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, attempt = i, "host texture refused; trying a fallback");
+                }
+            }
         }
     }
+
     let texture = texture?;
     crate::host::name(&texture, || {
         // Its address, for the lifetime notes (`life`) of a freed one.
@@ -1262,6 +1303,31 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     Some(HostTexture::new(texture, initial, castable_formats))
 }
 
+/// The descriptions tried for a host texture, in order: what the title
+/// asked for first, then the ones that give up what the host may be
+/// refusing (the initial state, the clear value, unordered access, and for
+/// a colour target the render-target permission too), then plain memory.
+/// A depth target keeps its depth permission throughout: the host refuses a
+/// depth texture without one.
+fn attempts(flags: u32, state: u32) -> Vec<(u32, u32, bool)> {
+    const UNORDERED: u32 = 4;
+    const RENDER_TARGET: u32 = 1;
+    let mut out: Vec<(u32, u32, bool)> = Vec::with_capacity(7);
+    for triple in [
+        (flags, state, true),
+        (flags, 0, true),
+        (flags, state, false),
+        (flags, 0, false),
+        (flags & !UNORDERED, 0, true),
+        (flags & !UNORDERED, 0, false),
+        (flags & !UNORDERED & !RENDER_TARGET, 0, false),
+    ] {
+        if !out.contains(&triple) {
+            out.push(triple);
+        }
+    }
+    out
+}
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     if this.is_null() {
