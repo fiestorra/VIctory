@@ -678,28 +678,41 @@ fn check(
 /// See other errors for details." — taken alone it names no operation, and
 /// the errors after it are what say which stage or feature is at fault.
 fn validator_reason(text: &str) -> String {
-    let errors: Vec<&str> = text
+    // The `note:` lines are not decoration: a refusal like "Flags must match
+    // usage" arrives with "note: Flags declared=…, actual=…", and that pair
+    // is what says which flag was wanted (#1987). They are reported with the
+    // first error rather than counted as errors of their own.
+    let kept: Vec<&str> = text
         .lines()
         .map(str::trim)
-        .filter(|l| l.contains("error:") && !l.contains("See other errors for details"))
+        .filter(|l| !l.contains("See other errors for details"))
         .filter(|l| !l.contains("Entry function performs some operation"))
         .collect();
-    if errors.is_empty() {
-        // Nothing but the announcement (or nothing at all): keep one line.
-        return text.lines().next().unwrap_or("").to_owned();
-    }
-    let mut named: Vec<&str> = Vec::new();
-    for e in &errors {
-        if !named.contains(e) {
-            named.push(e);
+    let mut errors: Vec<&str> = Vec::new();
+    for e in kept.iter().filter(|l| l.contains("error:")) {
+        if !errors.contains(e) {
+            errors.push(e);
         }
     }
+    let note = kept.iter().copied().find(|l| l.contains("note:"));
+    let Some(first) = errors.first() else {
+        // Nothing but the announcement (or nothing at all): keep one line,
+        // and a note if that is all there is to say.
+        return match note {
+            Some(note) => note.to_owned(),
+            None => text.lines().next().unwrap_or("").to_owned(),
+        };
+    };
     // The errors kept beyond the one reported.
     let more = errors.len().saturating_sub(1);
-    if more == 0 {
-        return named[0].to_owned();
+    let mut reason = match note {
+        Some(note) => format!("{first} ({note})"),
+        None => first.to_string(),
+    };
+    if more > 0 {
+        reason.push_str(&format!(" (and {more} more error{})", plural(more)));
     }
-    format!("{} (and {more} more error{})", named[0], plural(more))
+    reason
 }
 
 /// `s` when `n` is not one.
